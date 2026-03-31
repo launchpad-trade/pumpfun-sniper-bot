@@ -14,16 +14,16 @@ What this bot does:
 8. Withdraws all SOL back to main wallet
 
 Requirements:
-    pip install requests websockets base58
+    pip install requests websockets base58 python-dotenv
 
 Setup:
     1. Get your API key at https://launchpad.trade
     2. Get a free Helius RPC key at https://www.helius.dev
-    3. Fill in the CONFIG section below
+    3. Copy .env.example to .env and fill in your keys
     4. Run: python sniper_bot.py
 
 Documentation: https://docs.launchpad.trade
-Discord: https://discord.gg/launchpadtrade
+Discord: https://discord.com/invite/launchpad-trade
 """
 
 import requests
@@ -35,23 +35,30 @@ import asyncio
 import base64
 import struct
 import threading
+import logging
 import base58
+import websockets
+from dotenv import load_dotenv
+
+load_dotenv()
+
+logging.basicConfig(level=logging.INFO, format="%(message)s")
+log = logging.getLogger(__name__)
 
 
 # =============================================================================
-# CONFIG — Fill in your keys here
+# CONFIG — loaded from .env file (see .env.example)
 # =============================================================================
 
-API_KEY = "YOUR_LAUNCHPAD_TRADE_API_KEY"       # Get it at https://launchpad.trade
+API_KEY = os.getenv("LAUNCHPAD_API_KEY", "")
 BASE_URL = "https://api.launchpad.trade"
 
-MAIN_PRIVATE_KEY = "YOUR_MAIN_WALLET_PRIVATE_KEY"
-MAIN_PUBLIC_KEY = "YOUR_MAIN_WALLET_PUBLIC_KEY"
+MAIN_PRIVATE_KEY = os.getenv("MAIN_PRIVATE_KEY", "")
 
-# Solana RPC WebSocket (get a free key at https://www.helius.dev)
-SOLANA_WSS = "wss://mainnet.helius-rpc.com/?api-key=YOUR_HELIUS_API_KEY"
+# Solana RPC WebSocket
+SOLANA_WSS = os.getenv("SOLANA_WSS", "")
 
-# PumpFun Program ID
+# PumpFun Program ID (bonding curve — where tokens are created)
 PUMP_PROGRAM_ID = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
 
 # =============================================================================
@@ -70,6 +77,21 @@ FILTER_CREATOR = ""       # Creator wallet address (e.g. "7xKXtg...")
 FILTER_NAME = ""          # Token name contains (e.g. "DOGE")
 FILTER_SYMBOL = ""        # Token symbol contains (e.g. "DOGE")
 
+# =============================================================================
+# CONSTANTS
+# =============================================================================
+
+API_TIMEOUT = 30                  # Seconds before API request times out
+ANCHOR_DISCRIMINATOR_SIZE = 8     # Bytes to skip in Anchor event data
+PUBKEY_SIZE = 32                  # Bytes in a Solana public key
+SELL_DELAY = 3                    # Seconds to wait before selling
+SELL_RETRIES = 3                  # Number of sell retry attempts
+WS_RECONNECT_MAX_RETRIES = 5     # Max WebSocket reconnection attempts
+WS_RECONNECT_BASE_DELAY = 1      # Base delay for reconnection backoff (seconds)
+
+STATE_FILE = "state.json"
+WALLETS_FILE = "wallets.json"
+
 
 # =============================================================================
 # --- Do not modify below this line ---
@@ -80,12 +102,20 @@ HEADERS = {
     "Content-Type": "application/json"
 }
 
-STATE_FILE = "state.json"
-WALLETS_FILE = "wallets.json"
-
 detected_token = None
 snipe_ready = threading.Event()
 tokens_seen = 0
+
+
+# ---------------------------------------------------------------------------
+# Key derivation
+# ---------------------------------------------------------------------------
+
+def derive_public_key(private_key_b58):
+    """Derive the public key from a Solana private key (base58 keypair)."""
+    key_bytes = base58.b58decode(private_key_b58)
+    public_bytes = key_bytes[PUBKEY_SIZE:PUBKEY_SIZE * 2]
+    return base58.b58encode(public_bytes).decode("utf-8")
 
 
 # ---------------------------------------------------------------------------
@@ -96,20 +126,34 @@ def pause(msg="Press Enter to continue..."):
     input(f"\n-->  {msg}")
     print()
 
+
 def is_success(data):
     return data.get("success") or data.get("status") == "success"
 
+
 def api(method, path, body=None):
     url = f"{BASE_URL}{path}"
-    if method == "GET":
-        r = requests.get(url, headers=HEADERS)
-    else:
-        r = requests.post(url, headers=HEADERS, json=body)
-    data = r.json()
+    try:
+        if method == "GET":
+            r = requests.get(url, headers=HEADERS, timeout=API_TIMEOUT)
+        else:
+            r = requests.post(url, headers=HEADERS, json=body, timeout=API_TIMEOUT)
+        data = r.json()
+    except requests.exceptions.Timeout:
+        log.error(f"  [ERROR] Request timed out after {API_TIMEOUT}s: {path}")
+        return {"success": False, "error": {"code": "TIMEOUT", "message": f"Request timed out after {API_TIMEOUT}s"}}
+    except requests.exceptions.ConnectionError:
+        log.error(f"  [ERROR] Connection failed: {path}")
+        return {"success": False, "error": {"code": "CONNECTION_ERROR", "message": "Could not connect to API"}}
+    except requests.exceptions.JSONDecodeError:
+        log.error(f"  [ERROR] Invalid JSON response from {path} (HTTP {r.status_code})")
+        return {"success": False, "error": {"code": "INVALID_RESPONSE", "message": f"Non-JSON response (HTTP {r.status_code})"}}
+
     if not is_success(data):
         err = data.get("error", {})
-        print(f"  [ERROR] {err.get('code', 'UNKNOWN')} -- {err.get('message', data)}")
+        log.error(f"  [ERROR] {err.get('code', 'UNKNOWN')} -- {err.get('message', data)}")
     return data
+
 
 def load_state():
     if os.path.exists(STATE_FILE):
@@ -117,9 +161,11 @@ def load_state():
             return json.load(f)
     return {}
 
+
 def save_state(state):
     with open(STATE_FILE, "w") as f:
         json.dump(state, f, indent=2)
+
 
 def load_wallets():
     if os.path.exists(WALLETS_FILE):
@@ -127,9 +173,25 @@ def load_wallets():
             return json.load(f)
     return None
 
+
 def save_wallets(data):
     with open(WALLETS_FILE, "w") as f:
         json.dump(data, f, indent=2)
+
+
+def validate_config():
+    """Validate that all required config values are set before running."""
+    missing = []
+    if not API_KEY:
+        missing.append("LAUNCHPAD_API_KEY")
+    if not MAIN_PRIVATE_KEY:
+        missing.append("MAIN_PRIVATE_KEY")
+    if not SOLANA_WSS:
+        missing.append("SOLANA_WSS")
+    if missing:
+        log.error(f"  [ERROR] Missing environment variables: {', '.join(missing)}")
+        log.error(f"  Copy .env.example to .env and fill in your keys.")
+        sys.exit(1)
 
 
 # ---------------------------------------------------------------------------
@@ -140,7 +202,7 @@ def parse_create_event(b64_data):
     """Parse a PumpFun Create event from base64 Program data log."""
     try:
         raw = base64.b64decode(b64_data)
-        offset = 8
+        offset = ANCHOR_DISCRIMINATOR_SIZE
 
         def read_string(data, off):
             length = struct.unpack('<I', data[off:off + 4])[0]
@@ -150,8 +212,8 @@ def parse_create_event(b64_data):
             return s, off
 
         def read_pubkey(data, off):
-            pk = base58.b58encode(data[off:off + 32]).decode('utf-8')
-            off += 32
+            pk = base58.b58encode(data[off:off + PUBKEY_SIZE]).decode('utf-8')
+            off += PUBKEY_SIZE
             return pk, off
 
         event = {}
@@ -162,7 +224,8 @@ def parse_create_event(b64_data):
         event['bondingCurve'], offset = read_pubkey(raw, offset)
         event['creator'], offset = read_pubkey(raw, offset)
         return event
-    except Exception:
+    except (struct.error, IndexError, UnicodeDecodeError) as e:
+        log.warning(f"  [WARN] Failed to parse create event: {e}")
         return None
 
 
@@ -190,7 +253,7 @@ def step_health():
 # STEP 2 — Create Sniper Wallets
 # ---------------------------------------------------------------------------
 
-def step_create_wallets():
+def step_create_wallets(main_public_key):
     print("=" * 60)
     print(f"  STEP 2 — Create {NUM_SNIPERS} Sniper Wallets")
     print("=" * 60)
@@ -209,7 +272,7 @@ def step_create_wallets():
 
     snipers = data["data"]["wallets"]
     save_wallets({
-        "mainWallet": {"publicKey": MAIN_PUBLIC_KEY, "privateKey": MAIN_PRIVATE_KEY},
+        "mainWallet": {"publicKey": main_public_key, "privateKey": MAIN_PRIVATE_KEY},
         "snipers": snipers
     })
 
@@ -300,81 +363,85 @@ def matches_filter(event):
 
 async def monitor_pumpfun():
     global detected_token, tokens_seen
-    import websockets
 
-    async with websockets.connect(SOLANA_WSS) as ws:
-        subscribe = {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "logsSubscribe",
-            "params": [
-                {"mentions": [PUMP_PROGRAM_ID]},
-                {"commitment": "processed"}
-            ]
-        }
-        await ws.send(json.dumps(subscribe))
-
-        response = json.loads(await ws.recv())
-        sub_id = response.get("result")
-        print(f"  [SUBSCRIBED] Solana RPC logsSubscribe (id: {sub_id})")
-        print(f"  [LISTENING] Watching PumpFun for new tokens...")
-        print()
-
-        async for msg in ws:
-            data = json.loads(msg)
-            logs = (data.get("params", {})
-                       .get("result", {})
-                       .get("value", {})
-                       .get("logs", []))
-
-            if not logs:
-                continue
-
-            joined = " ".join(logs)
-            if "CreateV2" not in joined:
-                continue
-
-            signature = (data.get("params", {})
-                            .get("result", {})
-                            .get("value", {})
-                            .get("signature", ""))
-
-            for log_line in logs:
-                if "Program data: " not in log_line:
-                    continue
-
-                b64_data = log_line.split("Program data: ")[1]
-                event = parse_create_event(b64_data)
-
-                if not event:
-                    continue
-
-                tokens_seen += 1
-                has_filter = FILTER_CREATOR or FILTER_NAME or FILTER_SYMBOL
-
-                if has_filter and not matches_filter(event):
-                    print(f"  [SKIP #{tokens_seen}] {event['name']} ({event['symbol']}) — no match")
-                    continue
-
-                print()
-                print(f"  *** TARGET FOUND! ***")
-                print(f"     Name     : {event['name']}")
-                print(f"     Symbol   : {event['symbol']}")
-                print(f"     Mint     : {event['mint']}")
-                print(f"     Creator  : {event['creator']}")
-                print(f"     Time     : {time.strftime('%H:%M:%S')}")
-                print(f"     PumpFun  : https://pump.fun/coin/{event['mint']}")
-                print(f"     Axiom    : https://axiom.trade/t/{event['mint']}")
-                print()
-
-                detected_token = {
-                    "address": event["mint"],
-                    "name": event["name"],
-                    "symbol": event["symbol"],
-                    "creator": event["creator"]
+    for attempt in range(WS_RECONNECT_MAX_RETRIES):
+        try:
+            async with websockets.connect(SOLANA_WSS) as ws:
+                subscribe = {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "logsSubscribe",
+                    "params": [
+                        {"mentions": [PUMP_PROGRAM_ID]},
+                        {"commitment": "processed"}
+                    ]
                 }
-                snipe_ready.set()
-                return
+                await ws.send(json.dumps(subscribe))
+
+                response = json.loads(await ws.recv())
+                sub_id = response.get("result")
+                print(f"  [SUBSCRIBED] Solana RPC logsSubscribe (id: {sub_id})")
+                print(f"  [LISTENING] Watching PumpFun for new tokens...")
+                print()
+
+                async for msg in ws:
+                    data = json.loads(msg)
+                    logs = (data.get("params", {})
+                               .get("result", {})
+                               .get("value", {})
+                               .get("logs", []))
+
+                    if not logs:
+                        continue
+
+                    joined = " ".join(logs)
+                    if "CreateV2" not in joined:
+                        continue
+
+                    for log_line in logs:
+                        if "Program data: " not in log_line:
+                            continue
+
+                        b64_data = log_line.split("Program data: ")[1]
+                        event = parse_create_event(b64_data)
+
+                        if not event:
+                            continue
+
+                        tokens_seen += 1
+                        has_filter = FILTER_CREATOR or FILTER_NAME or FILTER_SYMBOL
+
+                        if has_filter and not matches_filter(event):
+                            print(f"  [SKIP #{tokens_seen}] {event['name']} ({event['symbol']}) — no match")
+                            continue
+
+                        print()
+                        print(f"  *** TARGET FOUND! ***")
+                        print(f"     Name     : {event['name']}")
+                        print(f"     Symbol   : {event['symbol']}")
+                        print(f"     Mint     : {event['mint']}")
+                        print(f"     Creator  : {event['creator']}")
+                        print(f"     Time     : {time.strftime('%H:%M:%S')}")
+                        print(f"     PumpFun  : https://pump.fun/coin/{event['mint']}")
+                        print(f"     Axiom    : https://axiom.trade/t/{event['mint']}")
+                        print()
+
+                        detected_token = {
+                            "address": event["mint"],
+                            "name": event["name"],
+                            "symbol": event["symbol"],
+                            "creator": event["creator"]
+                        }
+                        snipe_ready.set()
+                        return
+
+        except (websockets.exceptions.ConnectionClosed, ConnectionError, OSError) as e:
+            delay = WS_RECONNECT_BASE_DELAY * (2 ** attempt)
+            print(f"  [WS DISCONNECTED] {e} — reconnecting in {delay}s (attempt {attempt + 1}/{WS_RECONNECT_MAX_RETRIES})")
+            await asyncio.sleep(delay)
+
+    print(f"  [FATAL] WebSocket failed after {WS_RECONNECT_MAX_RETRIES} attempts")
+    sys.exit(1)
 
 
 def step_monitor():
@@ -487,13 +554,13 @@ def step_sell(snipers, token_address):
     print(f"  STEP 8 — Take Profit! Sell 100%")
     print("=" * 60)
 
-    print(f"  -> Waiting 3s for blockchain sync...")
-    time.sleep(3)
+    print(f"  -> Waiting {SELL_DELAY}s for blockchain sync...")
+    time.sleep(SELL_DELAY)
 
     private_keys = [w["privateKey"] for w in snipers]
 
-    for attempt in range(3):
-        print(f"  -> Selling 100% (attempt {attempt+1}/3)...")
+    for attempt in range(SELL_RETRIES):
+        print(f"  -> Selling 100% (attempt {attempt+1}/{SELL_RETRIES})...")
 
         start = time.time()
         data = api("POST", "/trading/instant/sell", {
@@ -505,17 +572,26 @@ def step_sell(snipers, token_address):
         elapsed = time.time() - start
 
         if is_success(data):
-            all_confirmed = True
+            transactions = data["data"].get("transactions", [])
+
+            if not transactions:
+                print(f"  [WARN] No transactions returned — sell may have failed")
+                if attempt < SELL_RETRIES - 1:
+                    print(f"  -> Retrying in {SELL_DELAY}s...")
+                    time.sleep(SELL_DELAY)
+                continue
+
+            all_confirmed = all(tx.get("status") == "confirmed" for tx in transactions)
+
             print(f"\n  RESULTS ({elapsed:.2f}s total):")
             print(f"  {'-'*50}")
-            for tx in data["data"].get("transactions", []):
+            for tx in transactions:
                 if tx.get("status") == "confirmed":
                     print(f"  [OK] {tx['wallet'][:20]}...")
                     print(f"       Tokens sold   : {tx.get('tokensSold', '?')}")
                     print(f"       SOL received  : {tx.get('solReceived', '?')} SOL")
                     print(f"       Confirm latency: {tx.get('confirmLatency', '?')}ms")
                 else:
-                    all_confirmed = False
                     print(f"  [FAIL] {tx['wallet'][:20]}... -> {tx.get('error', '?')}")
 
             summary = data["data"].get("summary", {})
@@ -526,9 +602,9 @@ def step_sell(snipers, token_address):
             if all_confirmed:
                 return data
 
-        if attempt < 2:
-            print(f"  -> Retrying in 3s...")
-            time.sleep(3)
+        if attempt < SELL_RETRIES - 1:
+            print(f"  -> Retrying in {SELL_DELAY}s...")
+            time.sleep(SELL_DELAY)
 
     return data
 
@@ -577,7 +653,7 @@ def step_close_accounts(snipers):
 # STEP 10 — Withdraw Everything to Main Wallet
 # ---------------------------------------------------------------------------
 
-def step_withdraw(snipers):
+def step_withdraw(snipers, main_public_key):
     print("=" * 60)
     print(f"  STEP 10 — Withdraw All SOL to Main Wallet")
     print("=" * 60)
@@ -587,7 +663,7 @@ def step_withdraw(snipers):
 
     data = api("POST", "/funding/withdraw", {
         "sourcePrivateKeys": private_keys,
-        "destinationPublicKey": MAIN_PUBLIC_KEY,
+        "destinationPublicKey": main_public_key,
         "amount": {"mode": "ALL"},
         "method": "DIRECT"
     })
@@ -597,7 +673,7 @@ def step_withdraw(snipers):
         print(f"  [OK] Withdrawn from {summary.get('successCount', '?')}/{summary.get('totalWallets', '?')} wallets")
         print(f"     Total SOL recovered: {summary.get('totalSolReceived', '?')} SOL")
 
-    bal = api("POST", "/wallets/balance", {"publicKeys": [MAIN_PUBLIC_KEY]})
+    bal = api("POST", "/wallets/balance", {"publicKeys": [main_public_key]})
     if is_success(bal):
         sol = bal["data"]["balances"][0].get("sol", 0)
         print(f"\n  Main wallet balance: {sol} SOL")
@@ -608,13 +684,17 @@ def step_withdraw(snipers):
 # ---------------------------------------------------------------------------
 
 def main():
+    validate_config()
+
+    main_public_key = derive_public_key(MAIN_PRIVATE_KEY)
+
     print()
     print("=" * 60)
     print("  SOLANA SNIPER BOT — Powered by Launchpad.Trade")
     print("  Monitor → Detect → Snipe → Profit → Cleanup")
     print("=" * 60)
     print()
-    print(f"  Main wallet : {MAIN_PUBLIC_KEY}")
+    print(f"  Main wallet : {main_public_key}")
     print(f"  Snipers     : {NUM_SNIPERS} wallets")
     print(f"  Buy amount  : {BUY_AMOUNT} SOL per wallet")
     print(f"  Detection   : Solana RPC logsSubscribe (processed)")
@@ -626,7 +706,7 @@ def main():
 
     # STEP 2
     pause("STEP 2: Create sniper wallets (Enter)")
-    snipers = step_create_wallets()
+    snipers = step_create_wallets(main_public_key)
 
     # STEP 3
     pause("STEP 3: Fund sniper wallets (Enter)")
@@ -672,7 +752,7 @@ def main():
 
     # STEP 10
     pause("STEP 10: Withdraw all SOL to main wallet (Enter)")
-    step_withdraw(snipers)
+    step_withdraw(snipers, main_public_key)
 
     print()
     print("=" * 60)

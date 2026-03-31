@@ -26,19 +26,26 @@ Built with [Launchpad.Trade](https://launchpad.trade) API + Solana RPC WebSocket
 ## Installation
 
 ```bash
-pip install requests websockets base58
+pip install requests websockets base58 python-dotenv
 ```
 
 ## Setup
 
-Open `sniper_bot.py` and fill in the CONFIG section:
-
-```python
-API_KEY = "YOUR_LAUNCHPAD_TRADE_API_KEY"
-MAIN_PRIVATE_KEY = "YOUR_MAIN_WALLET_PRIVATE_KEY"
-MAIN_PUBLIC_KEY = "YOUR_MAIN_WALLET_PUBLIC_KEY"
-SOLANA_WSS = "wss://mainnet.helius-rpc.com/?api-key=YOUR_HELIUS_API_KEY"
+1. Copy `.env.example` to `.env`:
+```bash
+cp .env.example .env
 ```
+
+2. Fill in your keys in `.env`:
+```env
+LAUNCHPAD_API_KEY=your_api_key_here
+MAIN_PRIVATE_KEY=your_private_key_here
+SOLANA_WSS=wss://mainnet.helius-rpc.com/?api-key=your_helius_key_here
+```
+
+The public key is automatically derived from your private key — no need to enter it separately.
+
+> **Important:** Never commit your `.env` file. Add it to `.gitignore`.
 
 ## Run
 
@@ -50,7 +57,7 @@ Press Enter at each step. At Step 5, the bot monitors PumpFun and auto-buys the 
 
 ## Snipe a specific token
 
-To target a specific token launch, set the filters:
+To target a specific token launch, edit the filters in `sniper_bot.py`:
 
 ```python
 FILTER_CREATOR = "CreatorWalletAddress"   # Only buy from this creator
@@ -70,7 +77,7 @@ Leave empty to snipe any new token.
 
 ## How it works
 
-**Detection:** Connects to Solana's RPC WebSocket and subscribes to the PumpFun program (`6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P`) using `logsSubscribe` at `processed` commitment (fastest). Filters for `CreateV2` instructions and parses the Anchor event data to extract token name, symbol, mint address, and creator.
+**Detection:** Connects to Solana's RPC WebSocket and subscribes to the PumpFun program (`6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P`) using `logsSubscribe` at `processed` commitment (fastest). Filters for `CreateV2` instructions and parses the Anchor event data to extract token name, symbol, mint address, and creator. Auto-reconnects with exponential backoff if the connection drops.
 
 **Execution:** Uses the [Launchpad.Trade](https://launchpad.trade) REST API to buy with multiple wallets in a single HTTP request. No Solana SDK needed, no transaction building, no RPC node configuration.
 
@@ -78,7 +85,7 @@ Leave empty to snipe any new token.
 
 - [Launchpad.Trade](https://launchpad.trade) — Solana Trading API
 - [Documentation](https://docs.launchpad.trade)
-- [Discord](https://discord.gg/launchpadtrade)
+- [Discord](https://discord.com/invite/launchpad-trade)
 - [YouTube Tutorial](https://youtube.com)
 
 ## Disclaimer
